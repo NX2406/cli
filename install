@@ -138,10 +138,11 @@ quota-exceeded:
 EOF
 
     # --- 生成 docker-compose.yml ---
+    # [FIX] 修正了镜像名称
     cat > "${INSTALL_DIR}/docker-compose.yml" <<EOF
 services:
   cli-proxy-api:
-    image: router-for-me/cli-proxy-api:latest
+    image: eceasy/cli-proxy-api:latest
     container_name: cli-proxy-api
     restart: unless-stopped
     network_mode: host
@@ -156,6 +157,10 @@ EOF
     cd "$INSTALL_DIR"
     
     echo -e "${BLUE}[INFO] 拉取镜像并启动...${PLAIN}"
+    
+    # 尝试清理旧容器（如果存在）
+    $DOCKER_COMPOSE_CMD down >/dev/null 2>&1 || true
+
     $DOCKER_COMPOSE_CMD pull
     $DOCKER_COMPOSE_CMD up -d
 
