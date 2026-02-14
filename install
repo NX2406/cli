@@ -1,0 +1,276 @@
+#!/bin/bash
+
+# ==================================================
+#  CLIProxyAPI 全能一键安装脚本
+#  支持：Debian/Ubuntu/CentOS/RedHat/Alma/Rocky
+#  功能：自动环境配置、Docker安装、应用部署、密钥设置
+# ==================================================
+
+# --- 颜色配置 ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+PLAIN='\033[0m'
+
+# --- 基础配置 ---
+INSTALL_DIR="/home/docker/cliproxyapi"
+
+# --- 必须以 Root 运行 ---
+[[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 用户运行此脚本！${PLAIN}" && exit 1
+
+# 全局变量初始化
+CMD=""
+RELEASE=""
+DOCKER_COMPOSE_CMD=""
+
+# --- 1. 系统检测 ---
+check_sys() {
+    # 如果已经检测过，不再重复检测
+    if [ -n "$CMD" ]; then return; fi
+
+    echo -e "${BLUE}[INFO] 正在检查系统环境...${PLAIN}"
+    if [[ -f /etc/redhat-release ]]; then
+        CMD="yum"
+        RELEASE="centos"
+    elif cat /etc/issue | grep -q -E -i "debian"; then
+        CMD="apt-get"
+        RELEASE="debian"
+    elif cat /etc/issue | grep -q -E -i "ubuntu"; then
+        CMD="apt-get"
+        RELEASE="ubuntu"
+    elif cat /etc/issue | grep -q -E -i "centos|red hat|redhat|alma|rocky"; then
+        CMD="yum"
+        RELEASE="centos"
+    elif cat /proc/version | grep -q -E -i "debian"; then
+        CMD="apt-get"
+        RELEASE="debian"
+    elif cat /proc/version | grep -q -E -i "ubuntu"; then
+        CMD="apt-get"
+        RELEASE="ubuntu"
+    elif cat /proc/version | grep -q -E -i "centos|red hat|redhat|alma|rocky"; then
+        CMD="yum"
+        RELEASE="centos"
+    else
+        echo -e "${RED}[ERROR] 无法检测操作系统，脚本可能无法正常运行。${PLAIN}"
+        RELEASE="unknown"
+        exit 1
+    fi
+}
+
+# --- 2. 基础依赖安装 ---
+install_base() {
+    check_sys
+    echo -e "${BLUE}[INFO] 正在安装基础依赖 (curl, wget, tar)...${PLAIN}"
+    if [ "$CMD" == "apt-get" ]; then
+        $CMD update -y
+        $CMD install -y curl wget tar sudo socat ca-certificates
+    elif [ "$CMD" == "yum" ]; then
+        $CMD makecache -y
+        $CMD install -y curl wget tar sudo socat ca-certificates
+    fi
+}
+
+# --- 3. Docker 环境自动检测与安装 ---
+install_docker() {
+    echo -e "${BLUE}[INFO] 正在检测 Docker 环境...${PLAIN}"
+    
+    # 检测 Docker 是否存在
+    if ! command -v docker > /dev/null 2>&1; then
+        echo -e "${YELLOW}[WARN] 未检测到 Docker，正在准备自动安装...${PLAIN}"
+        echo -e "${BLUE}[INFO] 调用官方脚本安装 Docker (这可能需要几分钟)...${PLAIN}"
+        curl -fsSL https://get.docker.com | bash
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}[ERROR] Docker 安装失败，请检查网络或手动安装。${PLAIN}"
+            exit 1
+        fi
+        echo -e "${BLUE}[INFO] 正在启动 Docker 服务...${PLAIN}"
+        systemctl enable docker
+        systemctl start docker
+    else
+        echo -e "${GREEN}[OK] 检测到 Docker 已安装。${PLAIN}"
+    fi
+
+    # 检测并配置 Docker Compose 命令
+    if docker compose version > /dev/null 2>&1; then
+        DOCKER_COMPOSE_CMD="docker compose"
+    elif command -v docker-compose > /dev/null 2>&1; then
+        DOCKER_COMPOSE_CMD="docker-compose"
+    else
+        echo -e "${YELLOW}[WARN] 未检测到 Docker Compose，正在尝试安装插件...${PLAIN}"
+        if [ "$CMD" == "apt-get" ]; then
+            $CMD install -y docker-compose-plugin || true
+        else
+            $CMD install -y docker-compose-plugin || true
+        fi
+        
+        # 二次检测
+        if docker compose version > /dev/null 2>&1; then
+            DOCKER_COMPOSE_CMD="docker compose"
+        elif command -v docker-compose > /dev/null 2>&1; then
+            DOCKER_COMPOSE_CMD="docker-compose"
+        else
+            echo -e "${RED}[ERROR] Docker Compose 安装失败，请手动安装。${PLAIN}"
+            exit 1
+        fi
+    fi
+}
+
+# --- 4. 部署核心逻辑 ---
+deploy_app() {
+    install_base
+    install_docker
+
+    echo -e "------------------------------------------------"
+    echo -e "${GREEN}环境准备完毕，开始部署 CLIProxyAPI${PLAIN}"
+
+    # 创建目录
+    mkdir -p "$INSTALL_DIR"
+
+    # 交互式询问 Key
+    echo -e "------------------------------------------------"
+    echo -e "${YELLOW}请设置管理面板密钥 (Secret Key)${PLAIN}"
+    echo -e "用途：登录 /management.html 页面进行管理"
+    echo -e "------------------------------------------------"
+    read -p "请输入密钥 (直接回车默认: setup-secret-key): " USER_KEY
+    if [ -z "$USER_KEY" ]; then
+        USER_KEY="setup-secret-key"
+    fi
+
+    # 转义 Key 中的特殊字符，防止配置文件出错
+    USER_KEY_ESCAPED="${USER_KEY//\\/\\\\}"
+    USER_KEY_ESCAPED="${USER_KEY_ESCAPED//\"/\\\"}"
+
+    # 写入配置文件 config.yaml (注意：此处缩进非常重要)
+    cat > "${INSTALL_DIR}/config.yaml" <<EOF
+host: "0.0.0.0"
+port: 8317
+
+tls:
+  enable: false
+  cert: ""
+  key: ""
+
+remote-management:
+  allow-remote: true
+  secret-key: "${USER_KEY_ESCAPED}"
+
+commercial-mode: false
+logging-to-file: true
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+EOF
+
+    # 写入 docker-compose.yml
+    cat > "${INSTALL_DIR}/docker-compose.yml" <<EOF
+services:
+  cli-proxy-api:
+    image: router-for-me/cli-proxy-api:latest
+    container_name: cli-proxy-api
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config.yaml:/CLIProxyAPI/config.yaml
+      - ./auths:/root/.cli-proxy-api
+      - ./logs:/CLIProxyAPI/logs
+EOF
+
+    # 创建挂载目录
+    mkdir -p "${INSTALL_DIR}/auths" "${INSTALL_DIR}/logs"
+
+    # 启动容器
+    cd "$INSTALL_DIR"
+    echo -e "${BLUE}[INFO] 拉取镜像并启动容器...${PLAIN}"
+    
+    # 尝试清理旧容器
+    $DOCKER_COMPOSE_CMD down >/dev/null 2>&1 || true
+    
+    # 拉取并启动
+    $DOCKER_COMPOSE_CMD pull
+    $DOCKER_COMPOSE_CMD up -d
+
+    if [ $? -eq 0 ]; then
+        echo -e "================================================"
+        echo -e "${GREEN}CLIProxyAPI 部署成功！${PLAIN}"
+        echo -e "================================================"
+        # 尝试获取IP，如果失败则显示 '你的IP'
+        SERVER_IP=$(curl -s ifconfig.me || echo "你的IP")
+        echo -e "管理地址 : http://${SERVER_IP}:8317/management.html"
+        echo -e "管理密钥 : ${YELLOW}(为安全起见不显示，请牢记)${PLAIN}"
+        echo -e "安装路径 : ${INSTALL_DIR}"
+        echo -e "================================================"
+    else
+        echo -e "${RED}[ERROR] 容器启动失败，请检查上方报错信息。${PLAIN}"
+    fi
+}
+
+# --- 5. 卸载逻辑 ---
+uninstall_app() {
+    # 必须先确保 docker compose 命令可用
+    install_docker
+    
+    echo -e "${RED}警告：此操作将删除所有配置、数据和日志！${PLAIN}"
+    read -p "确认卸载？(y/n): " confirm
+    if [[ "$confirm" == "y" ]]; then
+        if [ -d "$INSTALL_DIR" ]; then
+            cd "$INSTALL_DIR"
+            $DOCKER_COMPOSE_CMD down >/dev/null 2>&1
+            cd ..
+            rm -rf "$INSTALL_DIR"
+            echo -e "${GREEN}[OK] 已卸载并清理文件。${PLAIN}"
+        else
+            echo -e "${YELLOW}目录不存在，无需卸载。${PLAIN}"
+        fi
+    else
+        echo "操作已取消。"
+    fi
+}
+
+# --- 6. 菜单系统 ---
+show_menu() {
+    check_sys
+    clear
+    echo -e "============================================"
+    echo -e " CLIProxyAPI 全能一键脚本 ${YELLOW}[v2.2]${PLAIN}"
+    echo -e " 系统: ${RELEASE} | Docker: $(docker -v 2>/dev/null || echo '未安装')"
+    echo -e "============================================"
+    echo -e "${GREEN}1.${PLAIN} 安装/重装 CLIProxyAPI"
+    echo -e "${GREEN}2.${PLAIN} 更新应用 (保留配置)"
+    echo -e "${GREEN}3.${PLAIN} 卸载应用"
+    echo -e "${GREEN}4.${PLAIN} 查看日志"
+    echo -e "${GREEN}5.${PLAIN} 重启服务"
+    echo -e "--------------------------------------------"
+    echo -e "${GREEN}0.${PLAIN} 退出脚本"
+    echo -e "============================================"
+    read -p "请输入选项 [0-5]: " choice
+
+    case $choice in
+        1) deploy_app ;;
+        2) 
+           install_docker
+           cd "$INSTALL_DIR" || { echo -e "${RED}目录不存在，请先安装${PLAIN}"; exit 1; }
+           echo -e "${BLUE}正在更新镜像...${PLAIN}"
+           $DOCKER_COMPOSE_CMD pull && $DOCKER_COMPOSE_CMD up -d
+           echo -e "${GREEN}更新完成${PLAIN}"
+           ;;
+        3) uninstall_app ;;
+        4)
+           install_docker
+           cd "$INSTALL_DIR" || { echo -e "${RED}目录不存在，请先安装${PLAIN}"; exit 1; }
+           $DOCKER_COMPOSE_CMD logs -f --tail=50
+           ;;
+        5)
+           install_docker
+           cd "$INSTALL_DIR" || { echo -e "${RED}目录不存在，请先安装${PLAIN}"; exit 1; }
+           $DOCKER_COMPOSE_CMD restart
+           echo -e "${GREEN}已重启${PLAIN}"
+           ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${PLAIN}"; sleep 1; show_menu ;;
+    esac
+}
+
+# --- 入口 ---
+show_menu
